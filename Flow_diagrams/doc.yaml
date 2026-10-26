@@ -1,0 +1,226 @@
+openapi: 3.0.3
+info:
+  title: Multi-Agent Code Generation Chatbot API
+  description: >
+    A FastAPI-powered multi-agent chatbot that routes user queries through
+    a LangGraph orchestration pipeline. The pipeline classifies the request
+    and invokes specialist agents (code, review, research) in the correct
+    order, returning structured output per agent.
+  version: 2.0.0
+
+tags:
+  - name: ChatBot
+    description: Multi-agent chatbot for code generation, review, and research
+
+paths:
+
+  /order/api/v1/chatbot:
+    post:
+      tags:
+        - ChatBot
+      summary: Submit a query to the multi-agent chatbot
+      description: >
+        Accepts a user query and username. The orchestrator LLM classifies the
+        intent (code / review / research) and routes through the appropriate
+        agent pipeline. The pipeline supports:
+          - code → review → END
+          - code → review → research → code → review → END
+          - review → END
+          - research → END
+        All agent responses are returned in the data payload.
+      operationId: chatbotV1
+      requestBody:
+        required: true
+        description: User query and username for session memory isolation
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatbotRequest'
+            examples:
+              code_request:
+                summary: Code generation request
+                value:
+                  username: "gokul"
+                  user_query: "Write a Python function to reverse a linked list"
+              review_request:
+                summary: Code review request
+                value:
+                  username: "gokul"
+                  user_query: "Review this bubble sort — def bubble(a):\n  for i in range(len(a)):\n    for j in range(len(a)-1): a[j],a[j+1] = (a[j+1],a[j]) if a[j]>a[j+1] else (a[j],a[j+1])"
+              research_request:
+                summary: Standalone research request
+                value:
+                  username: "gokul"
+                  user_query: "What are the best practices for distributed rate limiting?"
+
+      responses:
+        '200':
+          description: Agents completed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatbotResponse'
+              examples:
+                code_with_review:
+                  summary: Code generation + review passed
+                  value:
+                    status_code: 200
+                    message: "Success"
+                    request_id: "3fa85f64-5717-4562-b3fc-2c963f66afa6"
+                    errors: []
+                    data:
+                      code: "def reverse_linked_list(head):\n    prev = None\n    curr = head\n    while curr:\n        nxt = curr.next\n        curr.next = prev\n        prev = curr\n        curr = nxt\n    return prev"
+                      code_description: "Iteratively reverses a singly linked list by re-pointing each node's next pointer. Time O(n), Space O(1)."
+                      review_response:
+                        correctness: "Logic is correct and handles empty list and single-node cases"
+                        performance: "O(n) time and O(1) space — optimal for in-place reversal"
+                        security: "No security concerns"
+                        style: "Clean and readable variable names"
+                        suggestions: "Add type hints using Optional[ListNode] for head parameter"
+                      research_response: null
+                research_only:
+                  summary: Standalone research request
+                  value:
+                    status_code: 200
+                    message: "Success"
+                    request_id: "9ab12f64-1234-4562-c4fd-3d074g77bgb7"
+                    errors: []
+                    data:
+                      code: null
+                      code_description: null
+                      review_response: null
+                      research_response: "Distributed rate limiting strategies include: Token Bucket (smooth bursts, Redis-backed), Sliding Window Log (accurate but memory-heavy), Fixed Window Counter (simple, thundering herd risk), and Sliding Window Counter (balance of accuracy and memory). For high-throughput APIs, Redis with Lua scripts ensures atomic counter operations. Use consistent hashing to distribute load across rate-limit nodes."
+        '422':
+          description: Request validation error — missing or invalid fields
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                status_code: 422
+                message: "user_query: field required"
+                request_id: "7fb95g75-6828-5673-d4gd-4e185h88chc8"
+                errors:
+                  - code: "ValidationErrorCode"
+                    message: "user_query: field required"
+                    error_code_id: "TASK_VAL_004"
+                data: null
+        '500':
+          description: Internal server error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                status_code: 500
+                message: "Service error: LLM invocation failed"
+                request_id: "1bc06h86-7939-6784-e5he-5f296i99didi9"
+                errors:
+                  - code: "InternalServerErrorCode"
+                    message: "Service error: LLM invocation failed"
+                    error_code_id: "TASK_SQL_005"
+                data: null
+
+components:
+  schemas:
+
+    ChatbotRequest:
+      type: object
+      required:
+        - username
+        - user_query
+      properties:
+        username:
+          type: string
+          description: Unique user identifier — used as LangGraph thread_id for session memory isolation
+          example: "gokul"
+        user_query:
+          type: string
+          description: The message or question sent by the user
+          example: "Write a Python function to reverse a linked list"
+
+    ChatbotData:
+      type: object
+      description: Structured output from the agent pipeline — fields are null when the agent was not invoked
+      properties:
+        code:
+          type: string
+          nullable: true
+          description: Raw executable code generated by the code agent
+        code_description:
+          type: string
+          nullable: true
+          description: Plain-English explanation of the generated code
+        review_response:
+          type: object
+          nullable: true
+          description: Structured review from the review agent
+          properties:
+            correctness:
+              type: string
+            performance:
+              type: string
+            security:
+              type: string
+            style:
+              type: string
+            suggestions:
+              type: string
+        research_response:
+          type: string
+          nullable: true
+          description: Research findings from the research agent — present for standalone research or when review triggered a research cycle
+
+    ChatbotResponse:
+      type: object
+      properties:
+        status_code:
+          type: integer
+          example: 200
+        message:
+          type: string
+          example: "Success"
+        request_id:
+          type: string
+          format: uuid
+          description: Unique ID for tracing this request across logs
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/ErrorDetail'
+        data:
+          $ref: '#/components/schemas/ChatbotData'
+
+    ErrorResponse:
+      type: object
+      properties:
+        status_code:
+          type: integer
+        message:
+          type: string
+        request_id:
+          type: string
+          format: uuid
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/ErrorDetail'
+        data:
+          nullable: true
+          example: null
+
+    ErrorDetail:
+      type: object
+      properties:
+        code:
+          type: string
+          description: Application-level error code constant
+          example: "InternalServerErrorCode"
+        message:
+          type: string
+          description: Human-readable error message
+          example: "Service error: LLM invocation failed"
+        error_code_id:
+          type: string
+          description: Unique traceable error ID for log correlation
+          example: "TASK_SQL_005"

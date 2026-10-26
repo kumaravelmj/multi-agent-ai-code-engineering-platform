@@ -1,0 +1,837 @@
+@startuml sequence_diagram
+
+title POST: Mulit Agent chatbot-client
+autonumber 1.0
+actor Client
+participant "clients/\nmain.py" as MAIN
+participant "clients/routes/agent_route.py" as Router
+participant "clients/models/agent_model.py" as Model
+participant "clients/services/agent_service.py" as Service
+participant "clients/Agents/code_agent.py" as CodeAgent
+participant "clients/Agents/review_agent.py" as ReviewAgent
+participant "clients/Agents/research_agent.py" as ResearchAgent
+participant "clients/Agents/prompt.py" as prompt
+participant "clients/utils/helper.py" as Utils
+participant "MCP Server\nhttp://localhost:8000/mcp" as MCPServer
+participant "clients/utils/exceptions/CustomAppException" as CustomAppException
+participant "clients/utils/error_logs.py" as Error_log
+participant "clients/Repositories/error_repo.py" as error_repo
+participant "clients/Repositories/database.py" as Database
+participant "clients/\nsettings.py" as settings
+participant ".env" as ENV
+
+' === IMPORT NOTES ===
+note over MAIN
+    **IMPORTS**
+    FastAPI, Request from fastapi — to create app instance and handle request context
+    RequestValidationError from fastapi.exceptions — to catch pydantic validation failures
+    JSONResponse from fastapi.responses — to send custom JSON formatted responses
+    CORSMiddleware from fastapi.middleware.cors — to allow cross-origin requests
+    router from routes.agent_route — to register the chatbot endpoint with the app
+    ErrorCode, ErrorCodeStatus from utils.exceptions.error_code — to assign structured error codes
+    APIResponse, Error from models.agent_model — to format all responses uniformly
+    CustomAppException from utils.exceptions.custom_app_exception — to raise business-specific exceptions
+    HttpStatusCode from settings — to use standardised HTTP status constants
+end note
+
+note over Router
+    **IMPORTS**
+    APIRouter, Query, Body, Path, Depends from fastapi — to define routes and extract request data
+    JSONResponse from fastapi.responses — to return JSON formatted response to client
+    AgentService from services.agent_service — to delegate business logic to the service layer
+    ErrorCode, ErrorCodeStatus from utils.exceptions.error_code — to assign structured error codes
+    CustomAppException from utils.exceptions.custom_app_exception — to raise application-specific errors
+    HttpStatusCode from settings — to use standardised HTTP status constants
+    APIResponse, data from models.agent_model — to validate request body and format response
+    log_error from utils.error_logs — to persist error details to the database
+end note
+
+note over Service
+    **IMPORTS**
+    ErrorCode, ErrorCodeStatus from utils.exceptions.error_code — to assign structured error codes
+    CustomAppException from utils.exceptions.custom_app_exception — to raise structured exceptions
+    HttpStatusCode, config from settings — to use HTTP constants and DB/AWS config
+    StateGraph, END from langgraph.graph — to build the multi-agent graph
+    AsyncPostgresSaver from langgraph.checkpoint.postgres.aio — for persistent per-user memory via PostgreSQL
+    SystemMessage, HumanMessage from langchain_core.messages — to build LLM message lists
+    CodeAgent, ReviewAgent, ResearchAgent from Agents — to delegate to specialist agents
+    orches_prompt from Agents.prompt — orchestrator classification prompt
+    get_llm, log_decorator from utils.helper — LLM factory and async-aware logging decorator
+    log_error from utils.error_logs — to persist error details to the database
+end note
+
+note over CodeAgent
+    **IMPORTS**
+    AsyncPostgresSaver from langgraph.checkpoint.postgres.aio — for thread-scoped persistent memory
+    create_react_agent from langgraph.prebuilt — to build the ReAct agent with tools, prompt, and structured output
+    config, HttpStatusCode from settings — to access DB, AWS, LLM, and MCP configuration values
+    code_system_prompt from Agents.prompt — ROLE/INSTRUCTIONS/CONDITIONS/FEW-SHOT for code generation
+    ErrorCode, ErrorCodeStatus from utils.exceptions.error_code — to assign structured error codes
+    CustomAppException from utils.exceptions.custom_app_exception — to raise structured exceptions
+    log_error from utils.error_logs — to persist error details to the database
+    get_llm, log_decorator from utils.helper — LLM factory and async-aware logging decorator
+    Code from models.agent_model — structured output Pydantic model with Code and  fields
+    MultiServerMCPClient from langchain_mcp_adapters.client — to connect to MCP server (wired in future)
+end note
+
+note over CustomAppException
+    **IMPORTS**
+    uuid — to generate unique request_id for tracing each exception instance
+    List, Optional from typing — to support multiple errors and optional fields
+    APIResponse, Error from models.agent_model — to build the standardised error response payload
+end note
+
+' === MAIN REQUEST FLOW ===
+group MAIN
+
+    note over Client
+        User hits: POST http://localhost:8080/order/api/v1/chatbot
+        **request_body**:
+        {
+            "username" : "gokul"
+            "user_query": "give me a code that cover all the oops concepts in python"
+        }
+    end note
+
+    Client -> Router : Client sends POST request — application matches /order/api/v1/chatbot and forwards to async chatbot_route()
+
+    activate Router
+    group chatbot_route
+        group chatbot_route Try
+            Router -> Router : APIRouter registered with prefix /MultiAgent/api and tag Order
+            Router -> Router : @router.post("/v1/chatbot") maps endpoint to async chatbot_route()
+            Router -> Router : request body extracted using Body() and bound to the data model
+            Router -> Model : request body passed to Pydantic data model for validation
+            activate Model
+            alt Validation Success
+                Model -> Model : user_query field checked - must be of type str and non-empty
+                Model -> Model : username field checked - must be of type str and non-empty
+                Model --> Router : validated data instance returned - request.username and request.user_query is accessible
+               
+            else Validation Failed
+                Model -> Model : Pydantic raises RequestValidationError with field-level error details
+                Model --> Router : RequestValidationError sent back with missing or wrong-type field info
+                deactivate Model
+                Router --> Client : JSONResponse returned with status 422 and validation error details
+                note over Client
+                    HTTP 422 — Validation Failed:
+                    {
+                      "detail": [
+                        {
+                          "loc": ["body", "user_query"],
+                          "msg": "field required",
+                          "type": "value_error.missing"
+                        }
+                      ]
+                    }
+                end note
+            end
+
+            Router -> Router : AgentService class instantiated and stored in obj variable
+            Router -> Service : await obj.chatbot_service(user_query, username) called  validated request body is passed to async service
+
+            group AgentService
+                group chatbot_service
+                    group chatbot_service Try
+                        activate Service
+                        Service -> Service : create a variable called graph and assign a new object for the Stategraph with an agentstate .
+                        Service -> Service : State has user_query, username, decision, AgentPath, Code, ReviewResponse, IsReviewValid, NeedsResearch, ResearchResponse, IsResearchCompleted.
+                        Service -> Service : Add nodes — node_orchs mapped to node_orchs(state), node_code mapped to node_code_agent(state), node_review mapped to node_review_agent(state), node_research mapped to node_researcher_agent(state)
+                        Service -> Service : set the entry point as node_orchs.
+                        Service -> Service : the graph call the node_orchs(state) in service
+                        group node_orchs
+                       
+                        Service -> Service : AsyncPostgresSaver context opened with db_uri — checkpointer.setup() called, graph compiled with checkpointer, agent_config set with thread_id=username
+                        Service -> Utils  :  get_llm(max_tokens=20, temperature=0) called — low-token deterministic LLM for one-word classification
+                        activate Utils
+                         group get_llm
+                                    Utils -> Utils : get_llm called with max_tokens and temperature as arguments
+                                    
+                                group get_bedrock_client
+                                    Utils -> settings : config imported from settings — triggers settings.py to load for the first time
+                                    activate settings
+                                    settings -> ENV : load_dotenv() scans filesystem and reads the .env file into os.env
+                                    activate ENV
+                                    ENV --> settings : all environment variables loaded — DB credentials, AWS keys, MODEL_ID, REGION, PROVIDER, MCP_SERVER_URL now in os.environ
+                                    deactivate ENV
+                                    settings -> settings : get_config() reads each variable via os.getenv() and populates the Config dataclass
+                                    note over settings
+                                        **Config dataclass fields populated from .env:**
+                                        DB config — db_host, db_port, db_name, db_username, db_password
+                                        AWS config — AWS_ACCESS_KEY, AWS_SECRET_KEY, REGION
+                                        LLM config — MODEL_ID, PROVIDER
+                                        MCP config — MCP_SERVER_URL
+                                        **HttpStatusCode class constants available from settings:**
+                                        OK, CREATED, NO_CONTENT, BAD_REQUEST, UNAUTHORIZED,
+                                        FORBIDDEN, NOT_FOUND, CONFLICT, UNPROCESSABLE_ENTITY,
+                                        INTERNAL_SERVER_ERROR, SERVICE_UNAVAILABLE
+                                    end note
+                                    settings --> Utils : config object returned — REGION used to create boto3 client
+                                    deactivate settings
+                                    Utils -> Utils : boto3.client created with service name bedrock-runtime and REGION from config
+                                    Utils --> Utils : bedrock_client returned
+                                end
+
+                                    Utils -> Utils : get_bedrock_client() called internally to obtain boto3 client
+                                    Utils -> settings : MODEL_ID and PROVIDER accessed from cached config — no .env re-read
+                                    activate settings
+                                    settings --> Utils : MODEL_ID and PROVIDER returned from already-built config object
+                                    deactivate settings
+                                    Utils -> Utils : ChatBedrock instance created — client, MODEL_ID, PROVIDER, and model_kwargs set with max_tokens and temperature
+                                    Utils --> Service : return the llm client to service.
+                                    deactivate Utils
+                            end
+                        Service -> prompt : in prompt.py file has the prompt for the llm
+                                activate prompt
+                        prompt -> Service : using the system_prompt variable we are going to import it
+                                deactivate prompt
+                        Service -> Service : orches_prompt stored in messages as SystemMessage — HumanMessage(user_query) appended
+                        Service -> Service : llm.invoke(messages) called — LLM returns exactly one word: code, review, or research
+                        Service -> Service : decision stored in state — AgentPath derived from decision substring match and also stored in state
+                        group route_by_userquery
+                        Service -> Service : route_by_userquery reads decision from state and applies substring match
+                        alt "research" in decision
+                        Service -> Service : returns "node_research" — user asked for research
+                        else "review" in decision
+                        Service -> Service : returns "node_review" — user asked for review only
+                        else "code" in decision
+                        Service -> Service : returns "node_code" — user asked for code generation
+                        else else 
+                        Service -> Service : return the llm response to user
+                        end
+                        Service -> Service : AgentPath set in state — "code", "review", or "research" — used by route_after_review to prevent re-code loop on direct review requests
+                        end
+                        note over Service
+                        graph.add_conditional_edges(
+                        "node_orchs",
+                        route_by_userquery,
+                        {
+                        "node_code": "node_code",
+                        "node_review": "node_review",
+                        "node_research": "node_research",
+                        END:END
+                        }
+                        )
+                        graph.add_edge("node_code", "node_review")
+                        end note    
+                        Service -> Service : based on the user_query this will follow the orchestration and call the exact node.
+                    end
+                      
+                       group node_code_agent
+                       
+                        Service -> CodeAgent : create_coder_agent(state) called — state contains user_query, username, and optionally Code, ReviewResponse, ResearchResponse for re-generation iterations
+                        group CodeAgent
+                        group create_code_agent
+                            group create_code_agent Try
+                                activate CodeAgent
+                                CodeAgent -> CodeAgent : code_system_prompt imported from prompt.py — ROLE, INSTRUCTIONS, CONDITIONS, FEW-SHOT for structured code output
+                                CodeAgent -> prompt : in prompt.py file has the prompt for the llm
+                                activate prompt
+                                prompt -> CodeAgent : code_system_prompt string returned
+                                deactivate prompt
+                                CodeAgent -> CodeAgent : user_query enriched — if Code and ReviewResponse exist in state, re-code prompt assembled with original query + previous code + review feedback; if ResearchResponse exists, appended as implementation context
+                                group Utils
+                                CodeAgent -> Utils : get_llm(max_tokens=1500, temperature=0.5) called — agent_config set with thread_id=username+"_code" and refer 1.18
+                                
+                                activate Utils
+                                    Utils --> CodeAgent : llm instance returned
+                                end
+                                    deactivate Utils
+                                CodeAgent -> CodeAgent : AsyncPostgresSaver context opened with db_uri — thread-scoped checkpointer set up for code agent memory
+                                group Utils
+                                CodeAgent -> Utils : To get the DB URI  call the function get_db_uri() in Utils 
+                                activate Utils 
+                                Utils -> CodeAgent : return the respected db_uri using config variable which is already imported
+                                deactivate Utils
+                                end
+                                CodeAgent -> CodeAgent : AsyncPostgresSaver context opened with db_uri — thread-scoped checkpointer set up for code agent memory
+                                CodeAgent -> CodeAgent : MultiServerMCPClient instantiated — transport set to streamable_http, url set to MCP_SERVER_URL from config (MCP tools will be wired here in future)
+                                note over CodeAgent
+                                    client = MultiServerMCPClient(
+                                      {
+                                        "day5-tools": {
+                                          "transport": "streamable_http",
+                                          "url": config.MCP_SERVER_URL
+                                        }
+                                      }
+                                    )
+                                end note
+                                CodeAgent -> MCPServer : await client.get_tools() — async call to MCP server to fetch all registered tool definitions
+                                activate MCPServer
+                                MCPServer --> CodeAgent : tools list returned  definitions received
+                                deactivate MCPServer
+
+                                CodeAgent -> CodeAgent : create_react_agent called — llm, tools list, code_system_prompt, response_format=Code checkpointer
+                                note over CodeAgent
+                                    agent = create_react_agent(
+                                      model=llm,
+                                      tools=tools,
+                                      prompt=code_system_prompt,
+                                      response_format=Code,
+                                      checkpointer=checkpointer
+                                    )
+                                end note
+
+                                CodeAgent -> CodeAgent : agent.ainvoke called with enriched user_query — LLM generates Code and  via structured output
+                                CodeAgent -> MCPServer : LLM invokes the appropriate MCP tool 
+                                activate MCPServer
+                                note over MCPServer
+                                    MCP Server handles the tool call:
+                                    - routes to the registered @router.tool() function
+                                    - executes the required operation 
+                                    - returns result over streamable HTTP transport
+                                end note
+                                MCPServer --> CodeAgent : tool result returned over HTTP.
+                                deactivate MCPServer
+
+                                CodeAgent -> CodeAgent : result = data["structured_response"] — Code Pydantic model accessed via Code
+                                CodeAgent --> Service : (code: str, code_description: str) tuple returned — state updated with Code 
+                                deactivate CodeAgent
+                                
+                            end
+
+                            group create_code_agent Exception
+                                group log_error
+                                    group log_error Try
+                                        CodeAgent -> Error_log : log_error called with file_name as code_agent.py, function_name as create_coder_agent, and error string
+                                        group Database
+                                        activate Error_log
+                                        Error_log -> Database : get_db = Database().SessionLocal() — module-level  DB session created at import time
+                                    activate Database
+                                    Database -> settings : config accessed for DB credentials — already cached, no .env re-read
+                                    activate settings
+                                    settings --> Database : db_host, db_port, db_name, db_username, db_password returned from config
+                                    deactivate settings
+                                    Database -> Database : connection URL assembled from DB config fields using postgresql+psycopg2 driver
+                                    Database -> Database : SQLAlchemy engine created from the connection URL using _create_engine() function which is already imported
+                                    Database -> Database : SessionLocal configured with the engine — autoflush and autocommit disabled
+                                    Database -> Database : get_db  session created from SessionLocal — reused across all tool calls
+                                    Database -->Error_log : new session returned
+                                        deactivate Database
+                                        end
+                                        Error_log -> error_repo : insert_error_log called with session, file_name, function_name, and error details
+
+                                        group insert_error_log
+                                            activate error_repo
+                                            group insert_error_log Try
+                                                error_repo -> error_repo : ErrorLog ORM object created with file_name, function_name, error, err_code, created_by, updated_by fields
+                                                note over error_repo
+                                                    log = ErrorLog(
+                                                      file_name=file_name,
+                                                      function_name=function_name,
+                                                      error=error,
+                                                      err_code=err_code,
+                                                      created_by=actor,
+                                                      updated_by=actor
+                                                    )
+                                                    session.add(log)
+                                                end note
+                                                error_repo -> error_repo : session committed and record refreshed — error entry persisted to error_logs table
+                                                error_repo --> Error_log : result dict returned with ok status and log id
+                                            end
+                                            group insert_error_log Exception
+                                                error_repo -> error_repo : session rolled back — failed log insert does not affect the main flow
+                                                error_repo --> Error_log : failure dict returned with error details
+                                            end
+                                            deactivate error_repo
+                                        end
+
+                                        deactivate Error_log
+                                    end
+                                    group log_error Exception
+                                        Error_log -> Error_log : all exceptions swallowed — logging must never break business flow
+                                        Error_log --> CodeAgent : failure dict returned 
+                                    end
+                                end
+
+                                CodeAgent -> CustomAppException : CustomAppException raised — INTERNAL_SERVER_ERROR code and status, error message describing LLM invocation failure
+                                activate CustomAppException
+                                CustomAppException --> CodeAgent : CustomAppException built and sent back
+                                deactivate CustomAppException
+                                CodeAgent --> Service : CustomAppException forwarded to service layer
+                                deactivate CodeAgent
+                                Service --> Router : CustomAppException forwarded to router
+                                Router --> MAIN : Router sends exception to main — triggers @exception_handler
+                                MAIN --> MAIN : @exception_handler(CustomAppException) triggered — formats error into APIResponse
+                                MAIN --> Client : error response returned to client
+                            end
+                        end
+                        end
+                        end
+                        group node_review_agent
+                        Service -> ReviewAgent : create_review_agent(state) called — node_code always edges directly into node_review
+                        
+                        group ReviewAgent
+                        group create_review_agent
+                            group create_review_agent Try
+                                activate ReviewAgent
+                                ReviewAgent -> ReviewAgent : review_system_prompt imported from prompt.py — ROLE, INSTRUCTIONS, CONDITIONS, FEW-SHOT for structured review output
+                                ReviewAgent -> prompt : in prompt.py file has the prompt for the llm
+                                activate prompt
+                                prompt -> ReviewAgent : review_system_prompt string returned
+                                deactivate prompt
+                                ReviewAgent -> ReviewAgent : user_query enriched — if Code present in state, review prompt assembled with original query and generated code appended
+                               group Utils
+                                ReviewAgent -> Utils : get_llm(max_tokens=1500, temperature=0.25) called — agent_config set with thread_id=username+"_review" and refer 1.18
+                                activate Utils
+                                    Utils --> ReviewAgent : llm instance returned
+                                end
+                                    deactivate Utils
+                                ReviewAgent -> ReviewAgent : AsyncPostgresSaver context opened with db_uri — thread-scoped checkpointer set up for review agent memory
+                                group Utils
+                                ReviewAgent -> Utils : To get the DB URI  call the function get_db_uri() in Utils 
+                                activate Utils 
+                                Utils -> ReviewAgent : return the respected db_uri using config variable which is already imported
+                                deactivate Utils
+                                end
+                                ReviewAgent -> ReviewAgent : MultiServerMCPClient instantiated — transport set to streamable_http, url set to MCP_SERVER_URL from config (MCP tools will be wired here in future)
+                                note over ReviewAgent
+                                    client = MultiServerMCPClient(
+                                      {
+                                        "day5-tools": {
+                                          "transport": "streamable_http",
+                                          "url": config.MCP_SERVER_URL
+                                        }
+                                      }
+                                    )
+                                end note
+                                ReviewAgent -> MCPServer : await client.get_tools() — async call to MCP server to fetch all registered tool definitions
+                                activate MCPServer
+                                MCPServer --> ReviewAgent : tools list returned with definitions received
+                                deactivate MCPServer
+
+                                ReviewAgent -> ReviewAgent : create_react_agent called — llm, tools list, review_system_prompt, response_format=Review, checkpointer
+                                note over ReviewAgent
+                                    agent = create_react_agent(
+                                      model=llm,
+                                      tools=tools,
+                                      prompt=review_system_prompt,
+                                      response_format=Review,
+                                      checkpointer=checkpointer
+                                    )
+                                end note
+
+                                ReviewAgent -> ReviewAgent : agent.ainvoke called with enriched user_query — LLM analyses code, populates ReviewResponse dict, sets IsReviewValid and NeedsResearch booleans
+                                ReviewAgent -> MCPServer : LLM invokes the appropriate MCP tool 
+                                activate MCPServer
+                                note over MCPServer
+                                    MCP Server handles the tool call:
+                                    - routes to the registered @router.tool() function
+                                    - executes the DB operation via AgentRepo
+                                    - returns result over streamable HTTP transport
+                                    (see sequence_diagram_server.puml for full server flow)
+                                end note
+                                MCPServer --> ReviewAgent : tool result returned over HTTP
+                                deactivate MCPServer
+
+                
+                                ReviewAgent -> ReviewAgent : result = data["structured_response"] — Review Pydantic model accessed via .ReviewResponse, .IsReviewValid, .NeedsResearch
+                                ReviewAgent --> Service : (review_response: dict, is_review_valid: bool, needs_research: bool) tuple returned — state updated with ReviewResponse, IsReviewValid, NeedsResearch
+                                deactivate ReviewAgent
+                            end
+                   
+                            group create_review_agent Exception
+                                group log_error
+                                    group log_error Try
+                                        ReviewAgent -> Error_log : log_error called with file_name as review_agent.py, function_name as create_review_agent, and error string
+                                        group Database
+                                        activate Error_log
+                                        Error_log -> Database : get_db = Database().SessionLocal() — module-level  DB session created at import time
+                                    activate Database
+                                    Database -> settings : config accessed for DB credentials — already cached, no .env re-read
+                                    activate settings
+                                    settings --> Database : db_host, db_port, db_name, db_username, db_password returned from config
+                                    deactivate settings
+                                    Database -> Database : connection URL assembled from DB config fields using postgresql+psycopg2 driver
+                                    Database -> Database : SQLAlchemy engine created from the connection URL using _create_engine() function which is already imported
+                                    Database -> Database : SessionLocal configured with the engine — autoflush and autocommit disabled
+                                    Database -> Database : get_db  session created from SessionLocal — reused across all tool calls
+                                    Database -->Error_log : new session returned
+                                        deactivate Database
+                                        end
+                                        Error_log -> error_repo : insert_error_log called with session, file_name, function_name, and error details
+
+                                        group insert_error_log
+                                            activate error_repo
+                                            group insert_error_log Try
+                                                error_repo -> error_repo : ErrorLog ORM object created with file_name, function_name, error, err_code, created_by, updated_by fields
+                                                note over error_repo
+                                                    log = ErrorLog(
+                                                      file_name=file_name,
+                                                      function_name=function_name,
+                                                      error=error,
+                                                      err_code=err_code,
+                                                      created_by=actor,
+                                                      updated_by=actor
+                                                    )
+                                                    session.add(log)
+                                                end note
+                                                error_repo -> error_repo : session committed and record refreshed — error entry persisted to error_logs table
+                                                error_repo --> Error_log : result dict returned with ok status and log id
+                                            end
+                                            group insert_error_log Exception
+                                                error_repo -> error_repo : session rolled back — failed log insert does not affect the main flow
+                                                error_repo --> Error_log : failure dict returned with error details
+                                            end
+                                            deactivate error_repo
+                                        end
+
+                                        deactivate Error_log
+                                    end
+                                    group log_error Exception
+                                        Error_log -> Error_log : all exceptions swallowed — logging must never break business flow
+                                        Error_log --> ReviewAgent : failure dict returned 
+                                    end
+                                end
+
+                                ReviewAgent -> CustomAppException : CustomAppException raised — INTERNAL_SERVER_ERROR code and status, error message describing LLM invocation failure
+                                activate CustomAppException
+                                CustomAppException --> ReviewAgent : CustomAppException built and sent back
+                                deactivate CustomAppException
+                                ReviewAgent --> Service : CustomAppException forwarded to service layer
+                                deactivate ReviewAgent
+                                Service --> Router : CustomAppException forwarded to router
+                                Router --> MAIN : Router sends exception to main — triggers @exception_handler
+                                MAIN --> MAIN : @exception_handler(CustomAppException) triggered — formats error into APIResponse
+                                MAIN --> Client : error response returned to client
+                            end
+                        end
+                        end
+                        group route_after_review
+                        Service -> Service : route_after_review reads is_review_valid from state and applies substring match
+                        alt "review" in agentpath
+                        Service -> Service : returns "END" — It end the graph edge.
+                        else "True" in is_review_valid
+                        Service -> Service : returns "END" — user asked for review is over no updates
+                        else "True" in NeedsResearch
+                        Service -> Service : returns "node_research" — agent requested for research.
+                        else else 
+                        Service -> Service : returns code agents calls node_code to improve the code.
+                        end
+                        end
+                        end
+                        group node_research_agent
+                        Service -> Service : route_after_review evaluated — if AgentPath=="review" → END; if IsReviewValid==True → END; if NeedsResearch==True → node_research; else → node_code (re-generate with review feedback)
+                        Service -> ResearchAgent : create_research_agent(state) called — triggered when NeedsResearch=True or user routed directly to research
+                        
+                        group ResearcherAgent
+                        group create_researcher_agent
+                            group create_researcher_agent Try
+                                activate ResearchAgent
+                                ResearchAgent -> ResearchAgent : research_system_prompt imported from prompt.py — ROLE, INSTRUCTIONS, CONDITIONS, FEW-SHOT for structured research output
+                                ResearchAgent -> prompt : in prompt.py file has the prompt for the llm
+                                activate prompt
+                                prompt -> ResearchAgent : research_system_prompt string returned
+                                deactivate prompt
+                                ResearchAgent -> ResearchAgent : user_query enriched — if Code and ReviewResponse present, research prompt assembled with code + review feedback; otherwise treated as standalone research query
+                                group Utils
+                                ResearchAgent -> Utils : get_llm(max_tokens=1500, temperature=0.8) called — agent_config set with thread_id=username+"_research" and refer 1.18
+                                activate Utils
+                                    Utils --> ResearchAgent : llm instance returned
+                                end
+                                    deactivate Utils
+                                ResearchAgent -> ResearchAgent : AsyncPostgresSaver context opened with db_uri — thread-scoped checkpointer set up for research agent memory
+
+                                group Utils
+                                ResearchAgent -> Utils : To get the DB URI  call the function get_db_uri() in Utils 
+                                activate Utils 
+                                Utils -> ResearchAgent : return the respected db_uri using config variable which is already imported
+                                deactivate Utils
+                                end
+
+                                ResearchAgent -> ResearchAgent : MultiServerMCPClient instantiated — transport set to streamable_http, url set to MCP_SERVER_URL from config (MCP tools will be wired here in future)
+                                note over ResearchAgent
+                                    client = MultiServerMCPClient(
+                                      {
+                                        "day5-tools": {
+                                          "transport": "streamable_http",
+                                          "url": config.MCP_SERVER_URL
+                                        }
+                                      }
+                                    )
+                                end note
+                                ResearchAgent -> MCPServer : await client.get_tools() — async call to MCP server to fetch all registered tool definitions
+                                activate MCPServer
+                                MCPServer --> ResearchAgent : tools list returned with definitions received
+                                deactivate MCPServer
+
+                                ResearchAgent -> ResearchAgent : create_react_agent called — llm, tools list, research_system_prompt, response_format=Research, checkpointer
+                                note over ResearchAgent
+                                    agent = create_react_agent(
+                                      model=llm,
+                                      tools=tools,
+                                      prompt=research_system_prompt,
+                                      response_format=Research,
+                                      checkpointer=checkpointer
+                                    )
+                                end note
+
+                                ResearchAgent -> ResearchAgent : agent.ainvoke called — LLM researches topic, populates ResearchResponse string, sets IsResearchCompleted boolean
+                                ResearchAgent -> MCPServer : LLM invokes the appropriate MCP tool 
+                                activate MCPServer
+                                note over MCPServer
+                                    MCP Server handles the tool call:
+                                    - routes to the registered @router.tool() function
+                                    - executes the DB operation via AgentRepo
+                                    - returns result over streamable HTTP transport
+                                    (see sequence_diagram_server.puml for full server flow)
+                                end note
+                                MCPServer --> ResearchAgent : tool result returned over HTTP
+                                deactivate MCPServer
+
+                                
+                                ResearchAgent -> ResearchAgent : result = data["structured_response"] — Research Pydantic model accessed via .ResearchResponse, .IsResearchCompleted
+                                ResearchAgent --> Service : (research_response: str, is_research_completed: bool) tuple returned — state updated with ResearchResponse and IsResearchCompleted
+                                deactivate ResearchAgent
+                            end
+
+                            group create_researcher_agent Exception
+                                group log_error
+                                    group log_error Try
+                                        ResearchAgent -> Error_log : log_error called with file_name as research_agent.py, function_name as create_research_agent, and error string
+                                        group Database
+                                        activate Error_log
+                                        Error_log -> Database : get_db = Database().SessionLocal() — module-level  DB session created at import time
+                                    activate Database
+                                    Database -> settings : config accessed for DB credentials — already cached, no .env re-read
+                                    activate settings
+                                    settings --> Database : db_host, db_port, db_name, db_username, db_password returned from config
+                                    deactivate settings
+                                    Database -> Database : connection URL assembled from DB config fields using postgresql+psycopg2 driver
+                                    Database -> Database : SQLAlchemy engine created from the connection URL using _create_engine() function which is already imported
+                                    Database -> Database : SessionLocal configured with the engine — autoflush and autocommit disabled
+                                    Database -> Database : get_db  session created from SessionLocal — reused across all tool calls
+                                    Database -->Error_log : new session returned
+                                        deactivate Database
+                                        end
+                                        Error_log -> error_repo : insert_error_log called with session, file_name, function_name, and error details
+
+                                        group insert_error_log
+                                            activate error_repo
+                                            group insert_error_log Try
+                                                error_repo -> error_repo : ErrorLog ORM object created with file_name, function_name, error, err_code, created_by, updated_by fields
+                                                note over error_repo
+                                                    log = ErrorLog(
+                                                      file_name=file_name,
+                                                      function_name=function_name,
+                                                      error=error,
+                                                      err_code=err_code,
+                                                      created_by=actor,
+                                                      updated_by=actor
+                                                    )
+                                                    session.add(log)
+                                                end note
+                                                error_repo -> error_repo : session committed and record refreshed — error entry persisted to error_logs table
+                                                error_repo --> Error_log : result dict returned with ok status and log id
+                                            end
+                                            group insert_error_log Exception
+                                                error_repo -> error_repo : session rolled back — failed log insert does not affect the main flow
+                                                error_repo --> Error_log : failure dict returned with error details
+                                            end
+                                            deactivate error_repo
+                                        end
+
+                                        deactivate Error_log
+                                    end
+                                    group log_error Exception
+                                        Error_log -> Error_log : all exceptions swallowed — logging must never break business flow
+                                        Error_log --> ResearchAgent : failure dict returned 
+                                    end
+                                end
+
+                                ResearchAgent -> CustomAppException : CustomAppException raised — INTERNAL_SERVER_ERROR code and status, error message describing LLM invocation failure
+                                activate CustomAppException
+                                CustomAppException --> ResearchAgent : CustomAppException built and sent back
+                                deactivate CustomAppException
+                                ResearchAgent --> Service : CustomAppException forwarded to service layer
+                                deactivate ResearchAgent
+                                Service --> Router : CustomAppException forwarded to router
+                                Router --> MAIN : Router sends exception to main — triggers @exception_handler
+                                MAIN --> MAIN : @exception_handler(CustomAppException) triggered — formats error into APIResponse
+                                MAIN --> Client : error response returned to client
+                            end
+                        end
+                        end
+                        group route_after_research
+                        Service -> Service : route_after_research reads is_review_valid from state and applies substring match
+                        alt "True" in IsResearchCompleted
+                        Service -> Service : returns "END" — It end the graph edge.
+                        else else 
+                        Service -> Service : returns code agents calls node_code to improve the code.
+                        end
+                        end
+                        end
+                        Service -> Service : route_after_research evaluated — if IsResearchCompleted==True → END (standalone research); else → node_code (research feeds back into code generation)
+                        Service -> Service : graph execution complete — serialisable response dict built: {code, code_description, review_response, research_response} from state using .get() — missing fields are None
+                        Service --> Router : response dict returned to router layer
+                        
+                    end
+
+                    group chatbot_service Exception
+                        group log_error
+                            group log_error Try
+                                Service -> Error_log : log_error called with file_name as agent_service.py, function_name as chatbot_service, and error string
+                                group Database
+                                activate Error_log
+                                Error_log -> Database : get_db = Database().SessionLocal() — module-level  DB session created at import time
+                                activate Database
+                                Database -> settings : config accessed for DB credentials — already cached, no .env re-read
+                                activate settings
+                                settings --> Database : db_host, db_port, db_name, db_username, db_password returned from config
+                                deactivate settings
+                                Database -> Database : connection URL assembled from DB config fields using postgresql+psycopg2 driver
+                                Database -> Database : SQLAlchemy engine created from the connection URL using _create_engine() function which is already imported
+                                Database -> Database : SessionLocal configured with the engine — autoflush and autocommit disabled
+                                Database -> Database : get_db  session created from SessionLocal — reused across all tool calls
+                                Database --> Error_log : new session returned
+                                deactivate Database
+                                end
+                                Error_log -> error_repo : insert_error_log called with session, file_name, function_name, and error details
+
+                                group insert_error_log
+                                    activate error_repo
+                                    group insert_error_log Try
+                                        error_repo -> error_repo : ErrorLog ORM object created with file_name, function_name, error, err_code, created_by, updated_by fields
+                                        note over error_repo
+                                            log = ErrorLog(
+                                              file_name=file_name,
+                                              function_name=function_name,
+                                              error=error,
+                                              err_code=err_code,
+                                              created_by=actor,
+                                              updated_by=actor
+                                            )
+                                            session.add(log)
+                                        end note
+                                        error_repo -> error_repo : session committed and record refreshed — error entry persisted to error_logs table
+                                        error_repo --> Error_log : result dict returned with ok status and log id
+                                    end
+                                    group insert_error_log Exception
+                                        error_repo -> error_repo : session rolled back — failed log insert does not affect the main flow
+                                        error_repo --> Error_log : failure dict returned with error details
+                                    end
+                                    deactivate error_repo
+                                end
+
+                                deactivate Error_log
+                            end
+                            group log_error Exception
+                                Error_log -> Error_log : all exceptions swallowed — logging must never break business flow
+                                Error_log --> Service : failure dict returned 
+                            end
+                        end
+
+                        Service -> CustomAppException : CustomAppException raised — INTERNAL_SERVER_ERROR code and status, error message describing service failure
+                        activate CustomAppException
+                        CustomAppException --> Service : CustomAppException built and sent back
+                        deactivate CustomAppException
+                        Service --> Router : CustomAppException forwarded to router layer
+                        deactivate Service
+                        Router --> MAIN : CustomAppException forwarded to main layer
+                        MAIN --> MAIN : @exception_handler(CustomAppException) triggered — formats error into APIResponse
+                        MAIN --> Client : error response returned to client
+                    end
+                end
+            end
+
+            Router -> Router : data variable holds the structured dict from service
+            Router -> Router : APIResponse created — data from service and HttpStatusCode.OK passed in
+            note over Router
+                **APIResponse message logic:**
+                if custom message provided → use it
+                elif no errors → message = "Success"
+                elif exactly one error → message = that error's message
+                else → message = "Something went wrong."
+                request_id = uuid4() generated for unique tracing
+            end note
+            Router -> Router : JSONResponse built using to_dict() output and the HTTP status code
+            Router --> MAIN : JSON response forwarded to main layer
+        end
+
+        group chatbot_route Exception
+            group log_error
+                group log_error Try
+                    Router -> Error_log : log_error called with file_name as agent_route.py, function_name as chatbot_route, and error string
+                    group Database
+                    activate Error_log
+                    Error_log ->  Database : get_db = Database().SessionLocal() — module-level  DB session created at import time
+                    activate Database
+                    Database -> settings : config accessed for DB credentials — already cached, no .env re-read
+                    activate settings
+                    settings --> Database : db_host, db_port, db_name, db_username, db_password returned from config
+                    deactivate settings
+                    Database -> Database : connection URL assembled from DB config fields using postgresql+psycopg2 driver
+                    Database -> Database : SQLAlchemy engine created from the connection URL using _create_engine() function which is already imported
+                    Database -> Database : SessionLocal configured with the engine — autoflush and autocommit disabled
+                    Database -> Database : get_db  session created from SessionLocal — reused across all tool calls
+                    Database -->Error_log : new session returned
+                    deactivate Database
+                    end
+                    Error_log -> error_repo : insert_error_log called with session, file_name, function_name, and error details
+
+                    group insert_error_log
+                        activate error_repo
+                        group insert_error_log Try
+                            error_repo -> error_repo : ErrorLog ORM object created with file_name, function_name, error, err_code, created_by, updated_by fields
+                            note over error_repo
+                                log = ErrorLog(
+                                  file_name=file_name,
+                                  function_name=function_name,
+                                  error=error,
+                                  err_code=err_code,
+                                  created_by=actor,
+                                  updated_by=actor
+                                )
+                                session.add(log)
+                            end note
+                            error_repo -> error_repo : session committed and record refreshed — error entry persisted to error_logs table
+                            error_repo --> Error_log : result dict returned with ok status and log id
+                        end
+                        group insert_error_log Exception
+                            error_repo -> error_repo : session rolled back — failed log insert does not affect the main flow
+                            error_repo --> Error_log : failure dict returned with error details
+                        end
+                        deactivate error_repo
+                    end
+
+                    deactivate Error_log
+                end
+                group log_error Exception
+                    Error_log -> Error_log : all exceptions swallowed — logging must never break business flow
+                    Error_log --> Router : failure dict returned 
+                end
+            end
+
+            Router -> CustomAppException : CustomAppException raised — INTERNAL_SERVER_ERROR code and status, error message describing router failure
+            activate CustomAppException
+            CustomAppException --> Router : CustomAppException built and sent back
+            deactivate CustomAppException
+            deactivate Router
+            Router --> MAIN : CustomAppException forwarded to main layer
+            MAIN --> MAIN : @exception_handler(CustomAppException) triggered — formats error into APIResponse
+            MAIN --> Client : error response returned to client
+        end
+    end
+
+    MAIN --> Client : final successful response displayed to the user
+
+    note over Client
+        **sample response sent to the client**
+        {
+            "data": {
+                "code": "def reverse_string(s): return s[::-1]",
+                "code_description": "Reverses a string using slice notation. O(n) time, O(n) space.",
+                "review_response": {"correctness": "Correct", "performance": "Optimal", "security": "No issues", "style": "Clean", "suggestions": "Add type hints"},
+                "research_response": null
+            },
+            "errors": [],
+            "status_code": 200,
+            "request_id": "unique trace id generated per request",
+            "message": "Success"
+        }
+    end note
+
+    deactivate MAIN
+end
+
+@enduml

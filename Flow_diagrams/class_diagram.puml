@@ -1,0 +1,253 @@
+@startuml class_diagram
+skinparam classAttributeIconSize 0
+skinparam classFontSize 10
+skinparam packageStyle rectangle
+skinparam Linetype ortho
+
+package "Application Layer"{
+    class App <<src/main.py>>{
+        +app : FastAPI
+    }
+}
+
+package "Routes Layer" {
+   class APIRouter <<src/routers/router.py>>{
+       -agent_service: AgentService
+       +chatbot_route(username, user_query): JSONResponse
+   }
+}
+
+package "Service Layer" {
+   class AgentService <<src/services/agent_service.py>>{
+       +chatbot_service(user_query, username): dict
+       +node_orchs(state): dict
+       +node_code_agent(state): dict
+       +node_review_agent(state): dict
+       +node_researcher_agent(state): dict
+       +route_by_userquery(state): str
+       +route_after_review(state): str
+       +route_after_research(state): str
+   }
+   class State <<src/services/agent_service.py>>{
+       ' Required on initial invoke
+       +user_query: str
+       +username: str
+       ' Set by orchestrator
+       +content: str
+       +AgentPath: str
+       ' Code agent output
+       +Code: Optional[str]
+       +ReviewResponse: Optional[dict]
+       +IsReviewValid: Optional[bool]
+       +NeedsResearch: Optional[bool]
+       ' Research agent output
+       +ResearchResponse: Optional[str]
+       +IsResearchCompleted: Optional[bool]
+   }
+}
+
+package "AgentsLayer"{
+    class CodeAgents <<src/agents/code_agents.py>>{
+        -MCPClient: MultiServerMCPClient
+        +create_coder_agent(state): tuple[str, str]
+    }
+    class ReviewAgents <<src/agents/review_agents.py>>{
+        -MCPClient: MultiServerMCPClient
+        +create_review_agent(state): tuple[dict, bool, bool]
+    }
+    class ResearcherAgents <<src/agents/researcher_agents.py>>{
+        -MCPClient: MultiServerMCPClient
+        +create_research_agent(state): tuple[str, bool]
+    }
+    class prompt <<src/agents/prompt.py>>{
+        +orches_prompt : str
+        +code_system_prompt : str
+        +review_system_prompt : str
+        +research_system_prompt : str
+    }
+}
+
+
+package "Repository layer"{
+    class Error_repo <<src/repositories/error_repo.py>>{
+        +insert_error_log(session: Session,file_name: str,function_name: str,error: str,err_code: Optional[str] = None,actor: str = "system") -> Dict[str, Any]
+    }
+    class Database <<src/repositories/order_database.py>>{
+        +SessionLocal(): Session
+        +get_db(): Session
+        +_create_engine(): create_engine
+    }
+}
+
+package schema {
+    class error_logs <<src/repositories/schema/order_schema.py>>{
+        +error_log_id :int
+        +file_name :str
+        +function_name : str
+        +error :str
+        +error_code :str
+        +created_at : datetime
+        +created_by : str
+        +updated_at :datetime
+        +updated_by :Str
+    }
+}
+
+package "utils" {
+    class Utils <<src/utils/helper.py>>{
+        +get_bedrock_client()
+        +get_llm(max_tokens:int, temp:float): ChatBedrock
+        +log_decorator(func): callable
+        +get_db_uri()
+    }
+    class Error <<src/utils/exception/Error.py>>{
+        +code: str
+        +message: str
+        +error_code_id: Optional[str]
+        --
+        +to_dict(): dict
+    }
+    class CustomAppException <<src/utils/exception/custom_app_expection.py>>{
+        +message: str
+        +code: str
+        +status_code: int
+        +error_code_id: Optional[str]
+        +errors: List[Error]
+        +request_id: str
+        --
+        +to_api_response(): APIResponse
+        +from_errors(): CustomAppException
+    }
+    class ErrorCodeStatus <<src/utils/exceptions/error_codes.py>>{
+        +TRAINING_SQL_006: str
+        +TRAINING_SQL_005: str
+        +TRAINING_VAL_004: str
+    }
+    class Error_log <<src/utils/error_log.py>>{
+        +error_log(file_name,function_name,error):Dict
+    }
+}
+
+package "models" {
+    class APIResponse <<src/models/agent_model.py>>{
+       +data: Optional[Any]
+       +errors: List[Error]
+       +code: int
+       +message: str
+       +request_id: str
+       +to_dict(): dict
+   }
+   class Custom_error_handler <<src/models/agent_model.py>>{
+    +Custom_error_handler(error:Exception)
+   }
+   class ErrorCode <<src/models/agent_model.py>>{
+       +DATABASE_ERROR: str
+       +INTERNAL_SERVER_ERROR: str
+       +VALIDATION_ERROR: str
+   }
+
+   class UserQuery <<src/models/agent_model.py>>{
+        ' username drives thread_id for session memory
+        +username: str
+        +user_query: str
+   }
+
+   class Code <<src/models/agent_model.py>>{
+        +Code: str
+        +CodeDescription: str
+   }
+
+   class Review <<src/models/agent_model.py>>{
+        +ReviewResponse: dict
+        +IsReviewValid: bool
+        +NeedsResearch: bool
+   }
+
+   class Research <<src/models/agent_model.py>>{
+        +ResearchResponse: str
+        +IsResearchCompleted: bool
+   }
+}
+
+package "settings" {
+   class HttpStatusCode <<src/settings.py>>{
+       +OK: int
+       +CREATED: int
+       +BAD_REQUEST: int
+       +NOT_FOUND: int
+       +INTERNAL_SERVER_ERROR: int
+   }
+   class Config <<src/settings.py>>{
+        +db_host: str
+        +db_port: str
+        +db_name: str
+        +db_username: str
+        +db_password: str
+        +get_config():dataclass
+    }
+}
+
+' === Relationships ===
+
+'Application -> Route
+App --> APIRouter : calls
+App <-- APIRouter : returns
+
+' Route -> Service
+APIRouter --> AgentService: calls
+APIRouter <-- AgentService: returns
+AgentService -> State :uses
+APIRouter -> UserQuery : uses
+AgentService --> AgentsLayer: uses
+AgentService <-- AgentsLayer: returns
+
+' Service -> Utils
+AgentService -> APIResponse: uses
+
+Error_repo -> schema :uses
+
+AgentService -> Utils : uses
+CodeAgents -> CodeAgents :uses
+ReviewAgents -> Utils : uses 
+ResearcherAgents -> Utils : uses
+
+
+Utils -> settings : uses
+' Exception handling
+APIRouter ..> CustomAppException: raises
+AgentService ..> CustomAppException: raises
+
+CustomAppException --> ErrorCode : uses
+CustomAppException --> ErrorCodeStatus : uses
+
+APIResponse --> Error : uses
+APIResponse --> settings : uses
+models -> settings :uses
+
+ErrorCode --> APIResponse: uses
+
+Database --> Config :uses
+
+Utils --> Config :uses
+
+Error_log -> Error_repo :uses
+
+APIRouter  ..> Error_log : may raise
+AgentService ..> Error_log : may raise
+ResearcherAgents ..> Error_log : may raise
+ReviewAgents ..> Error_log : may raise
+CodeAgents ..> Error_log : may raise
+
+Error_log <--> Database
+
+' Model bindings for agents
+CodeAgents -> Code : response_format
+ReviewAgents -> Review : response_format
+ResearcherAgents -> Research : response_format
+AgentService -> prompt : imports
+ResearcherAgents --> prompt : imports
+ReviewAgents --> prompt : imports
+CodeAgents --> prompt : import
+
+
+@enduml
